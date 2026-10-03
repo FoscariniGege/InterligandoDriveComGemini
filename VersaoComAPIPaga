@@ -1,0 +1,138 @@
+import json
+import time
+import pandas as pd
+import concurrent.futures
+import threading
+from google.colab import drive
+from google import genai
+from google.genai import types
+from google.colab import userdata
+
+# 1. CONEXÃO COM O GOOGLE DRIVE
+print("Conectando ao Google Drive...")
+drive.mount('/content/drive')
+
+# 2. CONFIGURAÇÕES PRINCIPAIS
+API_KEY = userdata.get('Chave_api')
+
+ARQUIVO_ENTRADA = "/content/drive/MyDrive/produtos.xls.xlsx"
+ARQUIVO_SAIDA = "/content/drive/MyDrive/produtos_preenchidos02.xlsx"
+
+TAMANHO_LOTE = 100       # 100 itens por lote (Zona de ouro: rápido e econômico)
+MAX_WORKERS = 5         # 5 requisições paralelas simultâneas (Processa 500 itens de uma vez)
+SALVAR_A_CADA_X_LOTES = 5
+
+# 3. INICIALIZAÇÃO DA API E LEITURA DA PLANILHA
+client = genai.Client(api_key=API_KEY)
+
+try:
+    df = pd.read_excel(ARQUIVO_SAIDA)
+    print(f"--> Retomando processamento a partir do arquivo '{ARQUIVO_SAIDA}'")
+except FileNotFoundError:
+    try:
+        df = pd.read_excel(ARQUIVO_ENTRADA)
+        print(f"--> Carregando arquivo inicial '{ARQUIVO_ENTRADA}'")
+    except Exception as e:
+        print(f"❌ Erro: Não foi possível carregar 'produtos.xlsx' no Google Drive.\nDetalhes: {e}")
+        raise SystemExit
+
+# Garante que as novas colunas existam na planilha
+novas_colunas = ['Peso_kg', 'Altura_cm', 'Largura_cm', 'Comprimento_cm']
+for col in novas_colunas:
+    if col not in df.columns:
+        df[col] = None
+
+# Lock de concorrência para atualização segura do DataFrame em threads
+df_lock = threading.Lock()
+
+# 4. FUNÇÃO DE CONSULTA COM PROMPT ULTRA-COMPACTO (ECONOMIZA TOKENS E TEMPO)
+def consultar_especificacoes_gemini(lote_itens):
+    # Envia JSON sem formatação (indent=None) para gastar o mínimo de tokens
+    prompt = f"""Especialista em peças automotivas/industriais: informe Peso (kg) e dimensões embalagem Altura, Largura, Comprimento (cm) em float ou null.
+Itens: {json.dumps(lote_itens, ensure_ascii=False)}
+Retorne estritamente um array JSON:
+[{{\"id\": num, \"Peso_kg\": float/null, \"Altura_cm\": float/null, \"Largura_cm\": float/null, \"Comprimento_cm\": float/null}}]"""
+
+    max_tentativas = 5
+    for tentativa in range(1, max_tentativas + 1):
+        try:
+            response = client.models.generate_content(
+                model='gemini-3.6-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.0
+                )
+            )
+            return json.loads(response.text)
+        except Exception as err:
+            erro_msg = str(err)
+            if "429" in erro_msg or "RESOURCE_EXHAUSTED" in erro_msg or "Quota" in erro_msg:
+                time.sleep(4 * tentativa)
+            else:
+                time.sleep(2 * tentativa)
+
+            if tentativa == max_tentativas:
+                return None
+    return None
+
+# 5. ESTRUTURAÇÃO DOS PENDENTES
+condicao_pendente = (
+    df['Peso_kg'].isna() | (df['Peso_kg'].astype(str).str.strip() == "") |
+    df['Altura_cm'].isna() | (df['Altura_cm'].astype(str).str.strip() == "")
+)
+linhas_pendentes = df[condicao_pendente].index.tolist()
+
+total_pendentes = len(linhas_pendentes)
+total_geral = len(df)
+
+print(f"Total de itens na planilha: {total_geral}")
+print(f"Itens pendentes de preenchimento: {total_pendentes}")
+
+# Monta os lotes
+lotes = []
+for i in range(0, total_pendentes, TAMANHO_LOTE):
+    lote_indices = linhas_pendentes[i : i + TAMANHO_LOTE]
+    lote_itens = []
+    for idx in lote_indices:
+        marca = str(df.at[idx, 'Marca']).strip()
+        cod = str(df.at[idx, 'Cod_Fabricante']).strip()
+        if marca and cod and marca.lower() != 'nan' and cod.lower() != 'nan':
+            lote_itens.append({"id": int(idx), "marca": marca, "cod_fabricante": cod})
+    if lote_itens:
+        lotes.append(lote_itens)
+
+total_lotes = len(lotes)
+print(f"--> Total de lotes a processar: {total_lotes} (em paralelo com {MAX_WORKERS} trabalhadores)\n")
+
+# 6. EXECUÇÃO PARALELA (MULTITHREADING)
+lotes_concluidos = 0
+
+def processar_lote_worker(lote):
+    resultados = consultar_especificacoes_gemini(lote)
+    return resultados
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    futures = {executor.submit(processar_lote_worker, lote): idx for idx, lote in enumerate(lotes)}
+
+    for future in concurrent.futures.as_completed(futures):
+        resultados = future.result()
+
+        with df_lock:
+            lotes_concluidos += 1
+            if resultados and isinstance(resultados, list):
+                for res in resultados:
+                    idx = res.get("id")
+                    if idx is not None and idx in df.index:
+                        df.at[idx, 'Peso_kg'] = res.get('Peso_kg')
+                        df.at[idx, 'Altura_cm'] = res.get('Altura_cm')
+                        df.at[idx, 'Largura_cm'] = res.get('Largura_cm')
+                        df.at[idx, 'Comprimento_cm'] = res.get('Comprimento_cm')
+
+            # Salva no Google Drive a cada X lotes concluídos
+            if lotes_concluidos % SALVAR_A_CADA_X_LOTES == 0 or lotes_concluidos == total_lotes:
+                df.to_excel(ARQUIVO_SAIDA, index=False)
+                print(f"🚀 Progresso: [{lotes_concluidos}/{total_lotes} lotes concluídos] — Planilha salva no Drive.")
+
+print("\n✅ Processamento concluído com sucesso!")
+print(f"A planilha atualizada está disponível no seu Google Drive em: '{ARQUIVO_SAIDA}'")
